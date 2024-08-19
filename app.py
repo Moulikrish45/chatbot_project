@@ -1,5 +1,6 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 from flask_sqlalchemy import SQLAlchemy
+import re
 
 app = Flask(__name__)
 
@@ -21,103 +22,72 @@ class Lead(db.Model):
 with app.app_context():
     db.create_all()
 
-@app.route('/capture_lead', methods=['POST'])
-def capture_lead():
-    data = request.json
-    name = data.get('name')
-    email = data.get('email')
-    phone = data.get('phone')
-    service_required = data.get('service_required')
+# Simple state management
+conversation_state = {}
 
-    if not all([name, email, phone, service_required]):
-        return jsonify({"error": "All fields are required!"}), 400
+@app.route('/chatbot', methods=['POST'])
+def chatbot():
+    global conversation_state
+    user_message = request.json.get('message').strip().lower()
+    user_id = request.remote_addr  # Example: using IP address as a simple user identifier
 
+    # Initialize state for new user session
+    if user_id not in conversation_state:
+        conversation_state[user_id] = {'step': None}
+
+    # Handle the conversation state and respond accordingly
+    if "service" in user_message or "need" in user_message:
+        conversation_state[user_id]['step'] = 'service_selection'
+        return jsonify({"message": "What type of service do you need?", 
+                        "options": ["Plumbing", "Electrical", "HVAC"]})
+    
+    elif user_message in ["plumbing", "electrical", "hvac"]:
+        conversation_state[user_id]['step'] = 'service_selected'
+        conversation_state[user_id]['service_required'] = user_message.capitalize()
+        return jsonify({"message": f"Great! We have contractors available for {user_message.capitalize()} services. How would you like to proceed?", 
+                        "options": ["Fill in a Form", "Call a Contractor", "Set an Appointment"]})
+    
+    elif conversation_state[user_id]['step'] == 'service_selected' and "form" in user_message:
+        conversation_state[user_id]['step'] = 'form_filling'
+        return jsonify({"message": "Please provide your name, email, and phone number to proceed with the form submission."})
+    
+    elif conversation_state[user_id]['step'] == 'service_selected' and "call" in user_message:
+        return jsonify({"message": "Please select a contractor from the list provided earlier and submit their name to receive the phone number."})
+    
+    elif conversation_state[user_id]['step'] == 'service_selected' and "appointment" in user_message:
+        conversation_state[user_id]['step'] = 'appointment_scheduling'
+        return jsonify({"message": "Please provide the appointment time and select contractors from the list provided earlier."})
+    
+    elif conversation_state[user_id]['step'] == 'form_filling':
+        user_details = parse_user_details(user_message)
+        if user_details:
+            name, email, phone = user_details
+            service_required = conversation_state[user_id].get('service_required')
+            return capture_lead_data(name, email, phone, service_required)
+        else:
+            return jsonify({"message": "I couldn't parse your details. Please provide your name, email, and phone number in the format: Name, Email, Phone."})
+
+    # Default fallback
+    else:
+        return jsonify({"message": "I didn't quite catch that. Can you please specify the service or action you'd like to take?"})
+
+def parse_user_details(message):
+    """Parse user details from a message using a regular expression."""
+    match = re.match(r'^\s*(?P<name>[a-zA-Z\s]+)\s*,\s*(?P<email>[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\s*,\s*(?P<phone>\d{10,15})\s*$', message)
+    if match:
+        return match.group('name'), match.group('email'), match.group('phone')
+    return None
+
+def capture_lead_data(name, email, phone, service_required):
+    """Capture the lead data and save it to the database."""
     new_lead = Lead(name=name, email=email, phone=phone, service_required=service_required)
     db.session.add(new_lead)
     db.session.commit()
-
-    return jsonify({"message": "Thank you! Your details have been captured."}), 201
-
-@app.route('/service_options', methods=['POST'])
-def service_options():
-    data = request.json
-    service_required = data.get('service_required')
-
-    if not service_required:
-        return jsonify({"error": "Service required is missing!"}), 400
-
-    # Dummy data for contractors
-    contractors = [
-        {"name": "Contractor A", "phone": "123-456-7890"},
-        {"name": "Contractor B", "phone": "234-567-8901"},
-        {"name": "Contractor C", "phone": "345-678-9012"},
-        {"name": "Contractor D", "phone": "456-789-0123"}
-    ]
-
-    # Provide options to the user
-    response = {
-        "message": f"We have contractors available for {service_required}. How would you like to proceed?",
-        "options": [
-            {"option": "Fill in a Form", "description": "Select up to four contractors and submit your information."},
-            {"option": "Call a Contractor", "description": "Here are the numbers of available contractors you can call directly."},
-            {"option": "Set an Appointment", "description": "Schedule an appointment with one or more contractors."}
-        ],
-        "contractors": contractors
-    }
-
-    return jsonify(response)
-
-@app.route('/submit_form', methods=['POST'])
-def submit_form():
-    data = request.json
-    selected_contractors = data.get('selected_contractors')
-    user_details = data.get('user_details')
-
-    if not selected_contractors or not user_details:
-        return jsonify({"error": "Contractors and user details are required!"}), 400
-
-    # Process form submission (Store in DB or send email, etc.)
-    return jsonify({"message": "Your information has been submitted to the selected contractors."})
-
-@app.route('/call_contractor', methods=['POST'])
-def call_contractor():
-    data = request.json
-    selected_contractor = data.get('selected_contractor')
-
-    if not selected_contractor:
-        return jsonify({"error": "Please select a contractor to call!"}), 400
-
-    # In a real application, here we could integrate with a VoIP service
-    return jsonify({"message": f"Please call {selected_contractor['phone']} to speak with {selected_contractor['name']}."})
-
-@app.route('/set_appointment', methods=['POST'])
-def set_appointment():
-    data = request.json
-    selected_contractors = data.get('selected_contractors')
-    appointment_time = data.get('appointment_time')
-
-    if not selected_contractors or not appointment_time:
-        return jsonify({"error": "Contractors and appointment time are required!"}), 400
-
-    # Process appointment scheduling (Store in DB, send notifications, etc.)
-    return jsonify({"message": "Your appointment has been scheduled with the selected contractors."})
-
-
-@app.route('/welcome', methods=['GET'])
-def welcome():
-    return jsonify(message="Hi there! I'm here to help you connect with top-rated contractors. How can I assist you today?")
+    return jsonify({"message": f"Thank you, {name}! Your details have been captured for {service_required}."})
 
 @app.route('/')
 def index():
     return render_template('index.html')
-
-@app.route('/chatbot', methods=['POST'])
-def chatbot():
-    user_message = request.json.get('message')
-    # Simple response logic for now
-    response_message = "You said: " + user_message
-    return jsonify({"message": response_message})
-
 
 if __name__ == '__main__':
     app.run(debug=True)
