@@ -17,10 +17,10 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
 # GPT-4 API Initialization
-openai.api_key = "your-openai-api-key"
+openai.api_key = "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"
 
 # ChromaDB Initialization for FAQ handling
-chroma_client = Client(Settings(embedding_function=OpenAIEmbeddingFunction(api_key="your-openai-api-key")))
+chroma_client = Client(Settings(embedding_function=OpenAIEmbeddingFunction(api_key="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")))
 
 class Lead(db.Model):
     id = db.Column(db.Integer, primary_key=True)
