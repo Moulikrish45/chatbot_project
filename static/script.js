@@ -36,11 +36,9 @@ function sendMessageToBot(message) {
     })
     .then(response => response.json())
     .then(data => {
-        addMessageToChat("Bot", data.message);
+        addMessageToChat("Bot", data.response);
         if (data.options) {
             displayOptions(data.options);
-        } else if (data.contractors) {
-            displayContractors(data.contractors, data.example);
         }
     })
     .catch(error => console.error("Error:", error));
@@ -81,24 +79,5 @@ function displayOptions(options) {
     });
 
     output.appendChild(optionsContainer);
-    output.scrollTop = output.scrollHeight;
-}
-
-function displayContractors(contractors, example) {
-    const output = document.getElementById("output");
-    const contractorsContainer = document.createElement("div");
-    contractorsContainer.classList.add("contractors-container");
-
-    contractors.forEach(contractor => {
-        const contractorItem = document.createElement("p");
-        contractorItem.innerText = contractor;
-        contractorsContainer.appendChild(contractorItem);
-    });
-
-    const exampleText = document.createElement("p");
-    exampleText.innerText = `Example: ${example}`;
-    contractorsContainer.appendChild(exampleText);
-
-    output.appendChild(contractorsContainer);
     output.scrollTop = output.scrollHeight;
 }

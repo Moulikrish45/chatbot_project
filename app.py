@@ -1,27 +1,36 @@
-from flask import Flask, request, jsonify, render_template, redirect, url_for
+import os
+import fitz  # PyMuPDF
+import uuid
+from flask import Flask, request, jsonify, render_template
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.utils import secure_filename
-import os
-import re
 import openai
-from chromadb import Client
+import chromadb
+from chromadb.utils import embedding_functions
 from chromadb.config import Settings
-from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 
-# Initialize Flask and Database
+# Initialize Flask app
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads/'
+app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///leads.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
 
-# GPT-4 API Initialization
-openai.api_key = "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"
+# Set up OpenAI API key
+openai.api_key = 'YOUR_OPENAI_API_KEY'  # Replace with your actual API key
 
-# ChromaDB Initialization for FAQ handling
-chroma_client = Client(Settings(embedding_function=OpenAIEmbeddingFunction(api_key="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")))
+# Initialize ChromaDB client
+chroma_client = chromadb.Client(Settings(
+    chroma_db_impl="duckdb+parquet",
+    persist_directory="chroma_db"  # Directory to store the database
+))
 
+# Create or get existing collection
+collection_name = "faq_collection"
+collection = chroma_client.get_or_create_collection(name=collection_name)
+
+# Define the Lead model for SQLite
 class Lead(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), nullable=False)
@@ -32,188 +41,219 @@ class Lead(db.Model):
 with app.app_context():
     db.create_all()
 
+# Function to parse the PDF and store FAQs in a dictionary
+def parse_pdf(pdf_path):
+    doc = fitz.open(pdf_path)
+    faq_data = {}
+    for page in doc:
+        text = page.get_text()
+        lines = text.splitlines()
+        for i in range(len(lines)):
+            if "Q:" in lines[i]:
+                question = lines[i].replace("Q:", "").strip()
+                if i + 1 < len(lines) and "A:" in lines[i + 1]:
+                    answer = lines[i + 1].replace("A:", "").strip()
+                    faq_data[question.lower()] = answer
+                    # Store in ChromaDB
+                    unique_id = str(uuid.uuid4())
+                    embedding = create_embedding(question)
+                    collection.add(
+                        ids=[unique_id],
+                        documents=[question],
+                        metadatas=[{"answer": answer}],
+                        embeddings=[embedding]
+                    )
+    return faq_data
+
+# Function to create embeddings using OpenAI's API
+def create_embedding(text):
+    response = openai.Embedding.create(
+        model="text-embedding-ada-002",
+        input=text
+    )
+    return response['data'][0]['embedding']
+
+# Load the FAQ data from the parsed PDF
+faq_data = parse_pdf("path_to_your_pdf_file.pdf")  # Update with your actual path
+
+# Initialize conversation state
 conversation_state = {}
 
-# Load FAQ data and store in ChromaDB
-def load_faq_data(filepath):
-    with open(filepath, 'r') as f:
-        return json.load(f)
-
-faq_data = load_faq_data("faq_data.json")
-
-for faq in faq_data:
-    chroma_client.add_document(faq['question'], faq['answer'])
-
-# Route to handle chatbot interactions
+# Route for chatbot interaction
 @app.route('/chatbot', methods=['POST'])
 def chatbot():
-    global conversation_state
-    user_message = request.json.get('message').strip().lower()
-    user_id = request.remote_addr
+    user_input = request.json.get('message').strip().lower()
+    user_id = request.remote_addr  # Using user's IP as a simple identifier
 
     if user_id not in conversation_state:
-        conversation_state[user_id] = {'step': None}
+        conversation_state[user_id] = {'step': 'introduction'}
 
-    # FAQ Handling
-    if 'faq' in user_message or 'question' in user_message:
-        return faq()
+    current_step = conversation_state[user_id]['step']
 
-    # Handle different steps of conversation
-    if conversation_state[user_id]['step'] is None:
-        conversation_state[user_id]['step'] = 'introduction'
-        return jsonify({
-            "message": "Hello! I am your service assistant. How can I help you today? You can upload an image or tell me what service you need.",
-            "options": ["Upload Image", "Specify Service"]
-        })
+    if current_step == 'introduction':
+        response = {
+            "message": "Hello! I’m here to help you connect with top-rated contractors. How can I assist you today?",
+            "options": ["Ask a Question", "Upload an Image", "Specify Service Needed"]
+        }
+        conversation_state[user_id]['step'] = 'awaiting_choice'
+        return jsonify(response)
 
-    elif conversation_state[user_id]['step'] == 'introduction':
-        if "upload image" in user_message:
+    elif current_step == 'awaiting_choice':
+        if user_input == 'ask a question':
+            response = {"message": "Sure, what’s your question?"}
+            conversation_state[user_id]['step'] = 'awaiting_question'
+            return jsonify(response)
+        elif user_input == 'upload an image':
+            response = {"message": "Please upload an image related to your issue."}
             conversation_state[user_id]['step'] = 'awaiting_image'
-            return jsonify({"message": "Please click the 'Upload Image' button near the send button to upload an image of the problem you are facing."})
-        elif "specify service" in user_message:
-            conversation_state[user_id]['step'] = 'service_selection'
-            return jsonify({"message": "What type of service do you need?", "options": ["Plumbing", "Electrical", "HVAC"]})
+            return jsonify(response)
+        elif user_input == 'specify service needed':
+            response = {
+                "message": "Please specify the service you need.",
+                "options": ["Plumbing", "Electrical", "HVAC", "Painting", "Roofing"]
+            }
+            conversation_state[user_id]['step'] = 'awaiting_service_selection'
+            return jsonify(response)
         else:
-            return jsonify({"message": "I didn't quite catch that. Would you like to upload an image or specify the service?", 
-                            "options": ["Upload Image", "Specify Service"]})
+            response = {
+                "message": "I didn’t understand that. Please choose one of the options.",
+                "options": ["Ask a Question", "Upload an Image", "Specify Service Needed"]
+            }
+            return jsonify(response)
 
-    elif conversation_state[user_id]['step'] == 'awaiting_image':
-        return jsonify({"message": "Please click the 'Upload Image' button near the send button to upload an image."})
+    elif current_step == 'awaiting_question':
+        user_question = user_input
+        # First check for exact matches in parsed FAQ data
+        for question, answer in faq_data.items():
+            if question in user_question:
+                conversation_state[user_id]['step'] = 'introduction'
+                return jsonify({"response": answer})
 
-    elif conversation_state[user_id]['step'] == 'service_selection':
-        if user_message in ["plumbing", "electrical", "hvac"]:
-            conversation_state[user_id]['step'] = 'service_selected'
-            conversation_state[user_id]['service_required'] = user_message.capitalize()
-            return jsonify({
-                "message": f"Great! We have contractors available for {user_message.capitalize()} services. How would you like to proceed?",
-                "options": ["Fill in a Form", "Call a Contractor", "Set an Appointment"]
-            })
+        # If no exact match is found, use ChromaDB for RAG
+        user_embedding = create_embedding(user_question)
+        results = collection.query(
+            query_embeddings=[user_embedding],
+            n_results=3
+        )
+        if results['documents']:
+            relevant_question = results['documents'][0][0]
+            relevant_answer = results['metadatas'][0][0]['answer']
+            return jsonify({"response": f"Based on your query, here's a related answer:\n\n{relevant_answer}"})
+
+        # If no relevant FAQ is found, fall back to GPT-4
+        gpt_response = openai.Completion.create(
+            engine="gpt-4",
+            prompt=f"User asked: {user_question}\n\nProvide a concise and helpful answer.",
+            max_tokens=150,
+            temperature=0.7,
+            n=1,
+            stop=None
+        )
+        answer = gpt_response.choices[0].text.strip()
+        conversation_state[user_id]['step'] = 'introduction'
+        return jsonify({"response": answer})
+
+    elif current_step == 'awaiting_service_selection':
+        service = user_input.capitalize()
+        if service in ["Plumbing", "Electrical", "HVAC", "Painting", "Roofing"]:
+            response = {
+                "message": f"Great! You have selected {service}. What would you like to do next?",
+                "options": ["Schedule an Appointment", "Get a Quote", "Talk to a Representative"]
+            }
+            conversation_state[user_id]['selected_service'] = service
+            conversation_state[user_id]['step'] = 'service_options'
+            return jsonify(response)
         else:
-            return jsonify({"message": "Please select a valid service option.", "options": ["Plumbing", "Electrical", "HVAC"]})
+            response = {
+                "message": "Please select a valid service from the options.",
+                "options": ["Plumbing", "Electrical", "HVAC", "Painting", "Roofing"]
+            }
+            return jsonify(response)
 
-    elif conversation_state[user_id]['step'] == 'service_selected':
-        if "form" in user_message:
-            conversation_state[user_id]['step'] = 'form_filling'
-            return jsonify({"message": "Please provide your name, email, and phone number to proceed with the form submission."})
-        elif "call" in user_message:
-            return jsonify({
-                "message": "Here are the available contractors you can call:",
-                "options": ["Contractor A: 123-456-7890", "Contractor B: 234-567-8901", "Contractor C: 345-678-9012", "Contractor D: 456-789-0123"]
-            })
-        elif "appointment" in user_message:
-            conversation_state[user_id]['step'] = 'appointment_scheduling'
-            return jsonify({
-                "message": "Please provide the appointment time and select contractors from the list below:",
-                "contractors": ["Contractor A", "Contractor B", "Contractor C", "Contractor D"],
-                "example": "Example: 10 pm Contractor A"
-            })
-        else:
-            return jsonify({"message": "Please select how you'd like to proceed.", "options": ["Fill in a Form", "Call a Contractor", "Set an Appointment"]})
-
-    elif conversation_state[user_id]['step'] == 'appointment_scheduling':
-        if any(contractor.lower() in user_message for contractor in ["contractor a", "contractor b", "contractor c", "contractor d"]):
-            conversation_state[user_id]['step'] = 'completed'
-            return jsonify({
-                "message": "Your appointment has been scheduled successfully. Is there anything else I can assist you with?",
-                "options": ["Yes, I have another issue", "No, that's all"]
-            })
-        else:
-            return jsonify({"message": "Please provide the appointment time and select a contractor from the list provided earlier."})
-
-    elif conversation_state[user_id]['step'] == 'form_filling':
-        user_details = parse_user_details(user_message)
-        if user_details:
-            name, email, phone = user_details
-            service_required = conversation_state[user_id].get('service_required')
-            conversation_state[user_id]['step'] = 'completed'
-            return capture_lead_data(name, email, phone, service_required)
-        else:
-            return jsonify({"message": "I couldn't parse your details. Please provide your name, email, and phone number in the format: Name, Email, Phone."})
-
-    elif conversation_state[user_id]['step'] == 'completed':
-        if "yes" in user_message:
+    elif current_step == 'service_options':
+        service = conversation_state[user_id]['selected_service']
+        if user_input == 'schedule an appointment':
+            response = {"message": f"Please provide your preferred date and time for the {service} appointment."}
+            conversation_state[user_id]['step'] = 'scheduling_appointment'
+            return jsonify(response)
+        elif user_input == 'get a quote':
+            response = {"message": f"Please provide details about the {service} work you need done."}
+            conversation_state[user_id]['step'] = 'getting_quote'
+            return jsonify(response)
+        elif user_input == 'talk to a representative':
+            response = {"message": "Connecting you to a representative..."}
             conversation_state[user_id]['step'] = 'introduction'
-            return jsonify({
-                "message": "How can I help you today? You can upload an image or tell me what service you need.",
-                "options": ["Upload Image", "Specify Service"]
-            })
-        elif "no" in user_message or "thanks" in user_message:
-            return jsonify({"message": "You're welcome! If you need any further assistance, feel free to reach out. Have a great day!"})
+            return jsonify(response)
         else:
-            return jsonify({
-                "message": "Is there anything else I can assist you with?",
-                "options": ["Yes, I have another issue", "No, that's all"]
-            })
+            response = {
+                "message": "Please select a valid option.",
+                "options": ["Schedule an Appointment", "Get a Quote", "Talk to a Representative"]
+            }
+            return jsonify(response)
+
+    elif current_step == 'scheduling_appointment':
+        appointment_details = user_input
+        service = conversation_state[user_id]['selected_service']
+        # Here, you’d typically process and store the appointment details
+        response = {
+            "message": f"Your {service} appointment has been scheduled for {appointment_details}. Is there anything else I can assist you with?",
+            "options": ["Yes", "No"]
+        }
+        conversation_state[user_id]['step'] = 'confirmation'
+        return jsonify(response)
+
+    elif current_step == 'getting_quote':
+        quote_details = user_input
+        service = conversation_state[user_id]['selected_service']
+        # Here, you’d typically process the quote details and generate a quote
+        response = {
+            "message": f"Thank you for the details. We will send you a quote for the {service} service shortly. Is there anything else I can assist you with?",
+            "options": ["Yes", "No"]
+        }
+        conversation_state[user_id]['step'] = 'confirmation'
+        return jsonify(response)
+
+    elif current_step == 'confirmation':
+        if user_input == 'yes':
+            response = {
+                "message": "How else can I assist you today?",
+                "options": ["Ask a Question", "Upload an Image", "Specify Service Needed"]
+            }
+            conversation_state[user_id]['step'] = 'awaiting_choice'
+            return jsonify(response)
+        elif user_input == 'no':
+            response = {"message": "Thank you for using our services. Have a great day!"}
+            conversation_state[user_id]['step'] = 'end'
+            return jsonify(response)
+        else:
+            response = {
+                "message": "Please select a valid option.",
+                "options": ["Yes", "No"]
+            }
+            return jsonify(response)
 
     else:
-        return jsonify({"message": "I didn't quite catch that. Can you please specify the service or action you'd like to take?"})
-
-# Helper function to parse user details
-def parse_user_details(message):
-    match = re.match(r'^\s*(?P<name>[a-zA-Z\s]+)\s*,\s*(?P<email>[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\s*,\s*(?P<phone>\d{10,15})\s*$', message)
-    if match:
-        return match.group('name'), match.group('email'), match.group('phone')
-    return None
-
-# Helper function to capture lead data
-def capture_lead_data(name, email, phone, service_required):
-    new_lead = Lead(name=name, email=email, phone=phone, service_required=service_required)
-    db.session.add(new_lead)
-    db.session.commit()
-    return jsonify({
-        "message": f"Thank you, {name}! Your details have been captured for {service_required}. Is there anything else I can assist you with?",
-        "options": ["Yes, I have another issue", "No, that's all"]
-    })
+        response = {"message": "I'm sorry, something went wrong. Let's start over. How can I assist you today?"}
+        conversation_state[user_id]['step'] = 'introduction'
+        return jsonify(response)
 
 # Route to handle image upload
 @app.route('/upload_image', methods=['POST'])
 def upload_image():
     if 'file' not in request.files:
-        return jsonify({"message": "No file part"})
+        return jsonify({"message": "No file part in the request."}), 400
     file = request.files['file']
     if file.filename == '':
-        return jsonify({"message": "No selected file"})
+        return jsonify({"message": "No selected file."}), 400
     if file:
-        if not os.path.exists(app.config['UPLOAD_FOLDER']):
-            os.makedirs(app.config['UPLOAD_FOLDER'])
-        
         filename = secure_filename(file.filename)
-        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(file_path)
-        
-        # Process the image using GPT's API to understand the problem
-        image_response = openai.Image.create(file=open(file_path, "rb"), purpose="image-analysis")
-        identified_service = image_response['data']['service']  # Example, adjust based on API response
-        
-        conversation_state[request.remote_addr]['step'] = 'service_selection'
-        conversation_state[request.remote_addr]['service_suggested'] = identified_service.capitalize()
-        
-        return jsonify({
-            "message": f"Image received. Based on the image, it looks like you might need {identified_service} services. Is that correct?",
-            "options": ["Yes", "No"]
-        })
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+        # Here you can process the image as needed
+        response = {"message": "Image uploaded successfully. How can I assist you further?"}
+        return jsonify(response)
 
-# Route to handle FAQ queries using GPT-4 and ChromaDB
-@app.route('/faq', methods=['POST'])
-def faq():
-    user_question = request.json.get('question')
-    
-    # Retrieve relevant data from ChromaDB
-    relevant_faqs = chroma_client.query(user_question, top_k=3)
-    
-    # Generate a response using GPT-4
-    gpt_response = openai.Completion.create(
-        engine="gpt-4",
-        prompt=create_prompt(user_question, relevant_faqs),
-        max_tokens=150
-    )
-    
-    return jsonify({"response": gpt_response.choices[0].text.strip()})
-
-def create_prompt(user_question, relevant_faqs):
-    faq_texts = "\n".join([f"Q: {faq['question']}\nA: {faq['answer']}" for faq in relevant_faqs])
-    return f"User asked: {user_question}\nRelevant FAQs:\n{faq_texts}\nAnswer:"
-
+# Home route
 @app.route('/')
 def index():
     return render_template('index.html')
